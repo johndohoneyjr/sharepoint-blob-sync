@@ -1,0 +1,36 @@
+# Security - Never commit credentials
+.sp_credentials
+config.env
+*.env
+.env*
+
+# Azure CLI credentials
+.azure/
+
+# Temporary files
+*.tmp
+/tmp/
+.DS_Store
+
+# Logs
+*.log
+logs/
+cron-job/logs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+
+# Backup files
+*.backup
+*.bak
+
+# Lock files
+*.lock
