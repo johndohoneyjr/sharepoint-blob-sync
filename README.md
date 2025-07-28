@@ -28,6 +28,55 @@ brew install azure-cli
 brew install curl jq
 ```
 
+### Install Dependencies (Windows)
+
+**Azure CLI:**
+1. Download the Azure CLI MSI installer from: https://aka.ms/installazurecliwindows
+2. Run the downloaded MSI file and follow the installation wizard
+3. Restart your command prompt or PowerShell after installation
+4. Verify installation: `az --version`
+
+**Alternative Azure CLI installation methods:**
+```powershell
+# Using PowerShell (requires PowerShell 5.1 or higher)
+Invoke-WebRequest -Uri https://aka.ms/installazurecliwindows -OutFile .\AzureCLI.msi; Start-Process msiexec.exe -Wait -ArgumentList '/I AzureCLI.msi /quiet'; Remove-Item .\AzureCLI.msi
+
+# Using Chocolatey (if installed)
+choco install azure-cli
+
+# Using winget (Windows Package Manager)
+winget install Microsoft.AzureCLI
+```
+
+**curl utility:**
+- **Windows 10 (1803+) and Windows 11**: curl is pre-installed
+- **Older Windows versions**: Download from https://curl.se/windows/ or install Git for Windows (includes curl)
+
+**jq utility:**
+1. Download the Windows executable from: https://stedolan.github.io/jq/download/
+2. Download `jq-win64.exe` (or `jq-win32.exe` for 32-bit systems)
+3. Rename the file to `jq.exe`
+4. Place it in a directory that's in your PATH (e.g., `C:\Windows\System32\` or create `C:\tools\jq\` and add to PATH)
+
+**Alternative jq installation:**
+```powershell
+# Using Chocolatey
+choco install jq
+
+# Using winget
+winget install stedolan.jq
+
+# Using Scoop (if installed)
+scoop install jq
+```
+
+**Verify installations:**
+```cmd
+az --version
+curl --version
+jq --version
+```
+
 ## Quick Start
 
 ### 1. Initial Setup
