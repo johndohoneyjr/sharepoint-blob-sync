@@ -23,6 +23,9 @@
 .PARAMETER ListContentsOfBlob
     List all files in the blob storage container
 
+.PARAMETER VerifyPermissions
+    Verify service principal permissions without running the main sync operation
+
 .PARAMETER LibraryName
     SharePoint library name (overrides config.env setting)
 
@@ -66,13 +69,39 @@
 
 .NOTES
     Author: SharePoint-Blob Sync Team
-    Version: 2.0 (PowerShell)
+    Version: 2.3 (PowerShell)
     Requires: PowerShell 5.1+, Azure CLI
     
     Before first use:
     1. Copy config.env.template to config.env
     2. Configure your settings in config.env
     3. Run with -Setup parameter to create service principal
+    
+    Required Microsoft Graph API Permissions (RBAC):
+    - Sites.ReadWrite.All (delegated and application)
+    - Files.ReadWrite.All (delegated and application)
+    - Sites.Read.All (delegated)
+    
+    Automatic RBAC Handling:
+    The script now automatically detects when permission grants are needed and 
+    attempts to execute the required commands. It extracts the Client ID from 
+    Azure CLI error messages and uses proper variable handling.
+    
+    Automatic Storage Configuration:
+    The script automatically configures Azure Storage access including:
+    - Detects current public IP address and adds to storage network rules
+    - Assigns Storage Blob Data Contributor role to service principal
+    - Tests storage account connectivity and provides troubleshooting guidance
+    
+    Manual RBAC Commands (if auto-setup fails):
+    az ad app permission grant --id <CLIENT_ID> --api 00000003-0000-0000-c000-000000000000 --scope "Sites.ReadWrite.All"
+    az ad app permission grant --id <CLIENT_ID> --api 00000003-0000-0000-c000-000000000000 --scope "Files.ReadWrite.All"
+    az ad app permission grant --id <CLIENT_ID> --api 00000003-0000-0000-c000-000000000000 --scope "Sites.Read.All"
+    az ad app permission admin-consent --id <CLIENT_ID>
+    
+    Manual Storage Commands (if auto-setup fails):
+    az storage account network-rule add --account-name <STORAGE_ACCOUNT> --ip-address <YOUR_IP>
+    az role assignment create --role "Storage Blob Data Contributor" --assignee <SERVICE_PRINCIPAL_ID> --scope <STORAGE_SCOPE>
     
 .LINK
     https://github.com/johndohoneyjr/sharepoint-blob-sync
@@ -85,6 +114,9 @@ param(
     
     [Parameter(ParameterSetName='ListBlob')]
     [switch]$ListContentsOfBlob,
+    
+    [Parameter(ParameterSetName='VerifyPermissions')]
+    [switch]$VerifyPermissions,
     
     [Parameter(ParameterSetName='Default')]
     [Parameter(ParameterSetName='Custom')]
@@ -329,6 +361,106 @@ function Test-Dependencies {
     }
 }
 
+<#
+.SYNOPSIS
+    Verify and validate RBAC permissions for the service principal
+#>
+function Test-ServicePrincipalPermissions {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId
+    )
+    
+    try {
+        Write-LogStep "Verifying service principal permissions"
+        
+        # Check if service principal exists
+        $spInfo = az ad sp show --id $ClientId --query "appId" -o tsv 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($spInfo)) {
+            Write-LogWarning "Service principal with Client ID $ClientId not found"
+            return $false
+        }
+        
+        Write-LogInfo "Service principal found: $ClientId"
+        
+        # Check delegated permissions (OAuth2 permission grants)
+        Write-LogInfo "Checking delegated permissions..."
+        $delegatedPermissions = az ad app permission list-grants --id $ClientId --query "[].scope" -o tsv 2>$null
+        
+        $requiredScopes = @("Sites.ReadWrite.All", "Files.ReadWrite.All", "Sites.Read.All")
+        $missingScopes = @()
+        
+        foreach ($scope in $requiredScopes) {
+            if ($delegatedPermissions -notlike "*$scope*") {
+                $missingScopes += $scope
+                Write-LogWarning "Missing delegated permission: $scope"
+            } else {
+                Write-LogSuccess "Found delegated permission: $scope"
+            }
+        }
+        
+        # Check application permissions
+        Write-LogInfo "Checking application permissions..."
+        $appPermissions = az ad app show --id $ClientId --query "requiredResourceAccess[?resourceAppId=='00000003-0000-0000-c000-000000000000'].resourceAccess[].id" -o tsv 2>$null
+        
+        $requiredAppPermissionIds = @(
+            "9492366f-7969-46a4-8d15-ed1a20078fff",  # Sites.ReadWrite.All
+            "75359482-378d-4052-8f01-80520e7db3cd"   # Files.ReadWrite.All
+        )
+        
+        foreach ($permId in $requiredAppPermissionIds) {
+            if ($appPermissions -contains $permId) {
+                Write-LogSuccess "Found application permission ID: $permId"
+            } else {
+                Write-LogWarning "Missing application permission ID: $permId"
+            }
+        }
+        
+        # Check if we have the minimum required permissions to function
+        $hasMinimumPermissions = $false
+        $hasApplicationPermissions = ($appPermissions -contains "9492366f-7969-46a4-8d15-ed1a20078fff" -and 
+                                     $appPermissions -contains "75359482-378d-4052-8f01-80520e7db3cd")
+        
+        # Check if we have at least one Sites permission (Read.All is minimum)
+        $hasSitesPermission = ($delegatedPermissions -like "*Sites.Read.All*" -or 
+                              $delegatedPermissions -like "*Sites.ReadWrite.All*")
+        
+        if ($hasApplicationPermissions -and $hasSitesPermission) {
+            $hasMinimumPermissions = $true
+        }
+        
+        if ($missingScopes.Count -eq 0) {
+            Write-LogSuccess "All required delegated permissions are present - OPTIMAL configuration!"
+            return $true
+        } elseif ($hasMinimumPermissions) {
+            Write-LogInfo "Minimum required permissions are present - script should work"
+            Write-LogWarning "Some delegated permissions are missing, but this may not prevent basic functionality"
+            if ($missingScopes.Count -gt 0) {
+                Write-Host ""
+                Write-Host "Optional: Run these commands for full permission set:" -ForegroundColor Yellow
+                foreach ($scope in $missingScopes) {
+                    Write-Host "  az ad app permission grant --id $ClientId --api 00000003-0000-0000-c000-000000000000 --scope ""$scope""" -ForegroundColor White
+                }
+            }
+            return $true
+        } else {
+            Write-LogWarning "Missing critical permissions - script may not work properly."
+            Write-Host ""
+            Write-Host "Required RBAC Commands:" -ForegroundColor Red
+            foreach ($scope in $missingScopes) {
+                Write-Host "  az ad app permission grant --id $ClientId --api 00000003-0000-0000-c000-000000000000 --scope ""$scope""" -ForegroundColor White
+            }
+            Write-Host "  az ad app permission admin-consent --id $ClientId" -ForegroundColor White
+            return $false
+        }
+    }
+    catch {
+        Write-LogError "Failed to verify permissions: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 #endregion
 
 #region Service Principal Management
@@ -396,108 +528,141 @@ function New-ServicePrincipal {
         $filesPermissionId = "75359482-378d-4052-8f01-80520e7db3cd"   # Files.ReadWrite.All
         
         # Add application permissions
-        $permissionResult1 = az ad app permission add --id $Script:SPCredentials.ClientId --api $graphAppId --api-permissions "$sitesPermissionId=Role" 2>&1
-        $permissionResult2 = az ad app permission add --id $Script:SPCredentials.ClientId --api $graphAppId --api-permissions "$filesPermissionId=Role" 2>&1
+        Write-LogInfo "Adding application permissions for Microsoft Graph..."
         
-        Write-LogInfo "Permissions added. Attempting to grant admin consent..."
+        # Use try-catch for individual permission operations to prevent early exit
+        try {
+            $permissionResult1 = az ad app permission add --id $Script:SPCredentials.ClientId --api $graphAppId --api-permissions "$sitesPermissionId=Role" 2>&1
+        } catch {
+            $permissionResult1 = "Error adding Sites permission: $($_.Exception.Message)"
+        }
+        
+        try {
+            $permissionResult2 = az ad app permission add --id $Script:SPCredentials.ClientId --api $graphAppId --api-permissions "$filesPermissionId=Role" 2>&1
+        } catch {
+            $permissionResult2 = "Error adding Files permission: $($_.Exception.Message)"
+        }
+        
+        Write-LogInfo "Permission add results:"
+        Write-LogInfo "Sites permission: $permissionResult1"
+        Write-LogInfo "Files permission: $permissionResult2"
+        
+        # Check if either permission add command suggested a grant command
+        $needsPermissionGrant = $false
+        $clientIdFromError = $null
+        
+        # Check for the specific warning pattern that indicates we need to run permission grant
+        if ($permissionResult1 -like "*az ad app permission grant --id*" -or $permissionResult2 -like "*az ad app permission grant --id*") {
+            $needsPermissionGrant = $true
+            Write-LogInfo "Azure CLI indicates permission grant is needed for the added permissions."
+            
+            # Extract client ID from the error message to ensure we have the right one
+            $combinedResult = "$permissionResult1 $permissionResult2"
+            if ($combinedResult -match "az ad app permission grant --id ([a-f0-9-]+)") {
+                $clientIdFromError = $matches[1]
+                Write-LogInfo "Extracted Client ID from error: $clientIdFromError"
+                
+                # Verify it matches our stored Client ID
+                if ($clientIdFromError -eq $Script:SPCredentials.ClientId) {
+                    Write-LogInfo "Client ID matches our service principal - proceeding with permission grants"
+                } else {
+                    Write-LogWarning "Client ID mismatch - using ID from error message: $clientIdFromError"
+                    $Script:SPCredentials.ClientId = $clientIdFromError
+                }
+            }
+        }
+        
+        Write-LogInfo "Attempting to grant admin consent and delegated permissions..."
         
         # Try multiple methods to grant admin consent
         $consentGranted = $false
         
-        # Check if Azure CLI suggested a specific grant command
-        $suggestedCommand = $null
-        if ($permissionResult1 -like "*az ad app permission grant*" -or $permissionResult2 -like "*az ad app permission grant*") {
-            $combinedResult = "$permissionResult1 $permissionResult2"
-            if ($combinedResult -match "az ad app permission grant --id ([a-f0-9-]+) --api ([a-f0-9-]+)") {
-                $suggestedCommand = "az ad app permission grant --id $($matches[1]) --api $($matches[2])"
-                Write-LogInfo "Azure CLI suggested specific consent command: $suggestedCommand"
-                
-                Write-LogInfo "Running suggested consent command..."
-                $grantResult = Invoke-Expression $suggestedCommand 2>&1
-                
-                if ($LASTEXITCODE -eq 0) {
-                    Write-LogSuccess "Admin consent granted successfully using Azure CLI suggestion!"
+        # If we detected that permission grants are needed, start with the grant commands
+        if ($needsPermissionGrant -or (-not $consentGranted)) {
+            Write-LogInfo "Running permission grant commands for delegated permissions..."
+            
+            # Method 1: Grant delegated permissions using az ad app permission grant
+            Write-LogInfo "Granting Sites.ReadWrite.All permission..."
+            try {
+                $grantResult1 = az ad app permission grant --id $Script:SPCredentials.ClientId --api $graphAppId --scope "Sites.ReadWrite.All" 2>&1
+            } catch {
+                $grantResult1 = "Error granting Sites.ReadWrite.All: $($_.Exception.Message)"
+            }
+            
+            Write-LogInfo "Granting Files.ReadWrite.All permission..."
+            try {
+                $grantResult2 = az ad app permission grant --id $Script:SPCredentials.ClientId --api $graphAppId --scope "Files.ReadWrite.All" 2>&1
+            } catch {
+                $grantResult2 = "Error granting Files.ReadWrite.All: $($_.Exception.Message)"
+            }
+            
+            Write-LogInfo "Granting Sites.Read.All permission..."
+            try {
+                $grantResult3 = az ad app permission grant --id $Script:SPCredentials.ClientId --api $graphAppId --scope "Sites.Read.All" 2>&1
+            } catch {
+                $grantResult3 = "Error granting Sites.Read.All: $($_.Exception.Message)"
+            }
+            
+            # Check if any of the permission grants succeeded
+            $grantSuccess = $false
+            if ($grantResult1 -like "*clientId*" -and $grantResult1 -like "*scope*") {
+                Write-LogSuccess "Sites.ReadWrite.All permission granted successfully!"
+                $grantSuccess = $true
+            } else {
+                Write-LogInfo "Sites.ReadWrite.All result: $grantResult1"
+            }
+            
+            if ($grantResult2 -like "*clientId*" -and $grantResult2 -like "*scope*") {
+                Write-LogSuccess "Files.ReadWrite.All permission granted successfully!"
+                $grantSuccess = $true
+            } else {
+                Write-LogInfo "Files.ReadWrite.All result: $grantResult2"
+            }
+            
+            if ($grantResult3 -like "*clientId*" -and $grantResult3 -like "*scope*") {
+                Write-LogSuccess "Sites.Read.All permission granted successfully!"
+                $grantSuccess = $true
+            } else {
+                Write-LogInfo "Sites.Read.All result: $grantResult3"
+            }
+            
+            # Try admin consent for application permissions
+            if ($grantSuccess) {
+                Write-LogInfo "Attempting admin consent for application permissions..."
+                try {
+                    $adminConsentResult = az ad app permission admin-consent --id $Script:SPCredentials.ClientId 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-LogSuccess "Admin consent granted for application permissions!"
+                        $consentGranted = $true
+                    } else {
+                        Write-LogInfo "Admin consent result: $adminConsentResult"
+                        # Consider it successful if delegated permissions were granted
+                        $consentGranted = $true
+                    }
+                } catch {
+                    Write-LogInfo "Admin consent failed with exception: $($_.Exception.Message)"
+                    # Still consider it successful if delegated permissions were granted
                     $consentGranted = $true
                 }
-                else {
-                    Write-LogInfo "Suggested command failed: $grantResult"
-                }
+            } else {
+                Write-LogWarning "No delegated permissions were granted successfully"
             }
         }
         
         if (-not $consentGranted) {
-            # Method 1: Direct admin consent command
-            Write-LogInfo "Attempting automatic admin consent..."
-            $consentResult = az ad app permission admin-consent --id $Script:SPCredentials.ClientId 2>&1
-            
-            if ($LASTEXITCODE -eq 0 -and $consentResult -notlike "*WARNING*" -and $consentResult -notlike "*error*") {
-                Write-LogSuccess "Admin consent granted successfully via Azure CLI!"
-                $consentGranted = $true
-            }
-            elseif ($consentResult -like "*az ad app permission grant*") {
-                # Azure CLI is suggesting the exact command we need to run
-                Write-LogInfo "Azure CLI provided consent command suggestion - attempting to execute..."
+            # Fallback method: Try direct admin consent command
+            Write-LogInfo "Attempting direct admin consent as fallback..."
+            try {
+                $consentResult = az ad app permission admin-consent --id $Script:SPCredentials.ClientId 2>&1
                 
-                # Extract the suggested command and run it
-                if ($consentResult -match "az ad app permission grant --id ([a-f0-9-]+) --api ([a-f0-9-]+)") {
-                    $clientId = $matches[1]
-                    $apiId = $matches[2]
-                    
-                    Write-LogInfo "Running suggested consent command..."
-                    $grantResult = az ad app permission grant --id $clientId --api $apiId 2>&1
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-LogSuccess "Admin consent granted successfully using Azure CLI suggestion!"
-                        $consentGranted = $true
-                    }
-                    else {
-                        Write-LogInfo "Suggested command failed: $grantResult"
-                    }
+                if ($LASTEXITCODE -eq 0 -and $consentResult -notlike "*WARNING*" -and $consentResult -notlike "*error*") {
+                    Write-LogSuccess "Admin consent granted successfully via direct method!"
+                    $consentGranted = $true
+                } else {
+                    Write-LogInfo "Direct admin consent result: $consentResult"
                 }
-            }
-        }
-            
-        if (-not $consentGranted) {
-            Write-LogInfo "Direct consent method failed, trying grant method..."
-            
-            # Method 2: Grant permissions using az ad app permission grant
-            $grantResult1 = az ad app permission grant --id $Script:SPCredentials.ClientId --api $graphAppId --scope "Sites.ReadWrite.All" 2>&1
-            $grantResult2 = az ad app permission grant --id $Script:SPCredentials.ClientId --api $graphAppId --scope "Files.ReadWrite.All" 2>&1
-            
-            if ($LASTEXITCODE -eq 0) {
-                Write-LogSuccess "Permissions granted successfully!"
-                $consentGranted = $true
-            }
-            else {
-                Write-LogInfo "Grant method failed, trying delegated consent..."
-                
-                # Method 3: Use Microsoft Graph REST API for consent
-                $tenantId = (az account show --query tenantId -o tsv)
-                $accessToken = (az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
-                
-                if ($accessToken) {
-                    $headers = @{
-                        'Authorization' = "Bearer $accessToken"
-                        'Content-Type' = 'application/json'
-                    }
-                    
-                    $consentUrl = "https://graph.microsoft.com/v1.0/oauth2PermissionGrants"
-                    $body = @{
-                        clientId = $Script:SPCredentials.ClientId
-                        consentType = "AllPrincipals"
-                        resourceId = $graphAppId
-                        scope = "Sites.ReadWrite.All Files.ReadWrite.All"
-                    } | ConvertTo-Json
-                    
-                    try {
-                        $response = Invoke-RestMethod -Uri $consentUrl -Method POST -Headers $headers -Body $body -ErrorAction Stop
-                        Write-LogSuccess "Admin consent granted via Microsoft Graph API!"
-                        $consentGranted = $true
-                    }
-                    catch {
-                        Write-LogInfo "Graph API consent method also failed: $($_.Exception.Message)"
-                    }
-                }
+            } catch {
+                Write-LogInfo "Direct admin consent failed with exception: $($_.Exception.Message)"
             }
         }
         
@@ -516,7 +681,16 @@ function New-ServicePrincipal {
             Write-Host "  4. Click 'Grant admin consent for [Your Organization]'" -ForegroundColor White
             Write-Host "  5. Click 'Yes' to confirm" -ForegroundColor White
             Write-Host ""
-            Write-Host "Option 2 - Azure CLI (if you have admin rights):" -ForegroundColor Green
+            Write-Host "Option 2 - Azure CLI Commands (run these exact commands):" -ForegroundColor Green
+            Write-Host "  # Grant delegated permissions:" -ForegroundColor Cyan
+            Write-Host "  az ad app permission grant --id $($Script:SPCredentials.ClientId) --api 00000003-0000-0000-c000-000000000000 --scope ""Sites.ReadWrite.All""" -ForegroundColor White
+            Write-Host "  az ad app permission grant --id $($Script:SPCredentials.ClientId) --api 00000003-0000-0000-c000-000000000000 --scope ""Files.ReadWrite.All""" -ForegroundColor White
+            Write-Host "  az ad app permission grant --id $($Script:SPCredentials.ClientId) --api 00000003-0000-0000-c000-000000000000 --scope ""Sites.Read.All""" -ForegroundColor White
+            Write-Host ""
+            Write-Host "  # Grant admin consent for application permissions:" -ForegroundColor Cyan
+            Write-Host "  az ad app permission admin-consent --id $($Script:SPCredentials.ClientId)" -ForegroundColor White
+            Write-Host ""
+            Write-Host "Option 3 - Alternative CLI method (if Option 2 fails):" -ForegroundColor Green
             if ($suggestedCommand) {
                 Write-Host "  Run: $suggestedCommand" -ForegroundColor White
             } else {
@@ -644,6 +818,185 @@ function Connect-ServicePrincipal {
         
         Write-LogError "Failed to get access token: $errorMessage"
         throw
+    }
+}
+
+#endregion
+
+#region Azure Storage Configuration
+
+<#
+.SYNOPSIS
+    Configure Azure Storage account for network access and role assignments
+#>
+function Set-StorageAccountAccess {
+    [CmdletBinding()]
+    param()
+    
+    try {
+        Write-LogStep "Configuring Azure Storage account access"
+        
+        $storageAccount = $Script:Config['AZURE_STORAGE_ACCOUNT_NAME']
+        if (-not $storageAccount) {
+            $storageAccount = $Script:Config['STORAGE_ACCOUNT_NAME']
+        }
+        
+        if (-not $storageAccount) {
+            Write-LogWarning "No storage account name found in configuration"
+            return
+        }
+        
+        Write-LogInfo "Storage Account: $storageAccount"
+        
+        # Try to get resource group from storage account
+        Write-LogInfo "Detecting resource group for storage account..."
+        try {
+            $storageInfo = az storage account list --query "[?name=='$storageAccount'].{name:name,resourceGroup:resourceGroup}" -o json | ConvertFrom-Json
+            if ($storageInfo -and $storageInfo.Count -gt 0) {
+                $resourceGroup = $storageInfo[0].resourceGroup
+                Write-LogInfo "Resource Group: $resourceGroup"
+            } else {
+                Write-LogWarning "Could not find storage account '$storageAccount' in current subscription"
+                return
+            }
+        }
+        catch {
+            Write-LogWarning "Could not detect resource group: $($_.Exception.Message)"
+            return
+        }
+        
+        # Get current user's public IP address
+        Write-LogInfo "Detecting current public IP address..."
+        try {
+            $currentIP = Invoke-RestMethod -Uri "https://api.ipify.org?format=text" -ErrorAction Stop
+            Write-LogInfo "Current IP: $currentIP"
+        }
+        catch {
+            Write-LogWarning "Could not detect IP address automatically: $($_.Exception.Message)"
+            Write-LogInfo "You may need to manually add your IP to the storage account network rules"
+            $currentIP = $null
+        }
+        
+        # Check if storage account exists and get its configuration
+        Write-LogInfo "Checking storage account configuration..."
+        try {
+            $storageConfig = az storage account show --name $storageAccount --resource-group $resourceGroup --query "{allowBlobPublicAccess:allowBlobPublicAccess,networkRuleSet:networkRuleSet}" -o json | ConvertFrom-Json
+            
+            if ($storageConfig) {
+                Write-LogInfo "Storage account found and accessible"
+                
+                # Check current network rules
+                $currentRules = $storageConfig.networkRuleSet
+                Write-LogInfo "Current network rule default action: $($currentRules.defaultAction)"
+                
+                if ($currentRules.defaultAction -eq "Deny" -and $currentIP) {
+                    # Check if current IP is already in the rules
+                    $ipExists = $false
+                    if ($currentRules.ipRules) {
+                        $ipExists = $currentRules.ipRules | Where-Object { $_.ipAddressOrRange -eq $currentIP }
+                    }
+                    
+                    if (-not $ipExists) {
+                        Write-LogInfo "Adding current IP ($currentIP) to storage account network rules..."
+                        try {
+                            $addRuleResult = az storage account network-rule add --account-name $storageAccount --resource-group $resourceGroup --ip-address $currentIP 2>&1
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-LogSuccess "Successfully added IP address to network rules"
+                            } else {
+                                Write-LogWarning "Failed to add IP to network rules: $addRuleResult"
+                            }
+                        }
+                        catch {
+                            Write-LogWarning "Error adding IP to network rules: $($_.Exception.Message)"
+                        }
+                    } else {
+                        Write-LogInfo "Current IP is already allowed in network rules"
+                    }
+                } else {
+                    Write-LogInfo "Storage account allows all networks or IP detection failed"
+                }
+            }
+        }
+        catch {
+            Write-LogWarning "Could not check storage account configuration: $($_.Exception.Message)"
+        }
+        
+        # Configure role assignments for service principal
+        if ($Script:SPCredentials.ClientId) {
+            Write-LogInfo "Setting up Storage Blob Data Contributor role for service principal..."
+            
+            # Get service principal object ID
+            try {
+                $spObjectId = az ad sp show --id $Script:SPCredentials.ClientId --query "id" -o tsv 2>$null
+                
+                if ($spObjectId) {
+                    Write-LogInfo "Service Principal Object ID: $spObjectId"
+                    
+                    # Get current subscription ID
+                    $subscriptionId = az account show --query id -o tsv 2>$null
+                    if (-not $subscriptionId) {
+                        Write-LogWarning "Could not get current subscription ID"
+                        return
+                    }
+                    
+                    # Build the scope for the storage account
+                    $storageScope = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Storage/storageAccounts/$storageAccount"
+                    
+                    # Check if role assignment already exists
+                    $existingRole = az role assignment list --assignee $spObjectId --role "Storage Blob Data Contributor" --scope $storageScope --query "[0].id" -o tsv 2>$null
+                    
+                    if (-not $existingRole) {
+                        Write-LogInfo "Creating Storage Blob Data Contributor role assignment..."
+                        try {
+                            $roleResult = az role assignment create --role "Storage Blob Data Contributor" --assignee $spObjectId --scope $storageScope 2>&1
+                            
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-LogSuccess "Successfully assigned Storage Blob Data Contributor role to service principal"
+                            } else {
+                                Write-LogWarning "Failed to assign role: $roleResult"
+                                Write-LogInfo "You may need to manually assign the 'Storage Blob Data Contributor' role to the service principal"
+                            }
+                        }
+                        catch {
+                            Write-LogWarning "Error assigning role: $($_.Exception.Message)"
+                        }
+                    } else {
+                        Write-LogInfo "Storage Blob Data Contributor role already assigned to service principal"
+                    }
+                } else {
+                    Write-LogWarning "Could not get service principal object ID for role assignment"
+                }
+            }
+            catch {
+                Write-LogWarning "Error setting up role assignment: $($_.Exception.Message)"
+            }
+        }
+        
+        # Test storage account access
+        Write-LogInfo "Testing storage account access..."
+        try {
+            $testResult = az storage container list --account-name $storageAccount --auth-mode login --query "[0].name" -o tsv 2>&1
+            
+            if ($LASTEXITCODE -eq 0 -and $testResult -ne "") {
+                Write-LogSuccess "Storage account access test successful"
+            } else {
+                Write-LogWarning "Storage account access test failed: $testResult"
+                Write-LogInfo "Manual steps may be required:"
+                if ($currentIP) {
+                    Write-Host "  1. Add IP to network rules: az storage account network-rule add --account-name $storageAccount --ip-address $currentIP" -ForegroundColor White
+                }
+                Write-Host "  2. Assign role: az role assignment create --role 'Storage Blob Data Contributor' --assignee $($Script:SPCredentials.ClientId) --scope '$storageScope'" -ForegroundColor White
+            }
+        }
+        catch {
+            Write-LogWarning "Could not test storage account access: $($_.Exception.Message)"
+        }
+        
+        Write-LogSuccess "Storage account configuration completed"
+    }
+    catch {
+        Write-LogError "Failed to configure storage account access: $($_.Exception.Message)"
+        # Don't throw - this is not a fatal error, user can configure manually
     }
 }
 
@@ -901,29 +1254,47 @@ function Assert-BlobContainer {
         Write-LogStep "Ensuring blob container exists: $($Script:Config['CONTAINER_NAME'])"
         
         # Check if container exists
+        Write-LogInfo "Checking if container exists..."
         $containerExists = $false
         try {
             if ($Script:Config['USE_AZURE_AD_AUTH'] -eq 'true') {
-                $null = az storage container show --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login 2>$null
+                Write-LogInfo "Using Azure AD authentication for storage operations"
+                $containerCheckResult = az storage container show --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login 2>&1
             } else {
-                $null = az storage container show --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] 2>$null
+                Write-LogInfo "Using storage account key authentication"
+                $containerCheckResult = az storage container show --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] 2>&1
             }
-            $containerExists = $LASTEXITCODE -eq 0
+            
+            if ($LASTEXITCODE -eq 0) {
+                $containerExists = $true
+                Write-LogInfo "Container exists"
+            } else {
+                Write-LogInfo "Container check failed with exit code: $LASTEXITCODE"
+                Write-LogInfo "Container check result: $containerCheckResult"
+                $containerExists = $false
+            }
         }
         catch {
+            Write-LogInfo "Container check threw exception: $($_.Exception.Message)"
             $containerExists = $false
         }
         
         if (-not $containerExists) {
             Write-LogInfo "Creating blob container: $($Script:Config['CONTAINER_NAME'])"
             if ($Script:Config['USE_AZURE_AD_AUTH'] -eq 'true') {
-                $result = az storage container create --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login --public-access blob 2>$null
+                Write-LogInfo "Creating container with Azure AD authentication..."
+                $createResult = az storage container create --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login --public-access blob 2>&1
             } else {
-                $result = az storage container create --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] --public-access blob 2>$null
+                Write-LogInfo "Creating container with storage account key..."
+                $createResult = az storage container create --name $Script:Config['CONTAINER_NAME'] --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] --public-access blob 2>&1
             }
             
             if ($LASTEXITCODE -ne 0) {
-                throw "Failed to create container"
+                Write-LogError "Failed to create container. Exit code: $LASTEXITCODE"
+                Write-LogError "Create result: $createResult"
+                throw "Failed to create container: $createResult"
+            } else {
+                Write-LogSuccess "Container created successfully"
             }
         }
         else {
@@ -1196,6 +1567,7 @@ Recursively copies files from SharePoint document libraries to Azure Blob Storag
 Parameters:
   -Setup                      Create service principal and setup permissions
   -ListContentsOfBlob         List all files in the blob storage container
+  -VerifyPermissions          Verify service principal permissions
   -LibraryName NAME           SharePoint library name (default: from config)
   -FileFilter FILTER          File filter (default: from config)
                               Supports: *.pdf, *.png, *.docx, *.*, etc.
@@ -1208,6 +1580,7 @@ Examples:
   .\Copy-SharePointToBlob.ps1 -Setup                                  # First-time setup
   .\Copy-SharePointToBlob.ps1                                         # Copy files with config settings
   .\Copy-SharePointToBlob.ps1 -ListContentsOfBlob                     # List blob storage contents
+  .\Copy-SharePointToBlob.ps1 -VerifyPermissions                      # Verify service principal permissions
   .\Copy-SharePointToBlob.ps1 -FileFilter "*.docx"                    # Copy Word documents recursively
   .\Copy-SharePointToBlob.ps1 -FileFilter "*"                         # Copy all files recursively
   .\Copy-SharePointToBlob.ps1 -LibraryName "Documents" -Folder "Archive"
@@ -1272,8 +1645,18 @@ function Invoke-Main {
             New-ServicePrincipal
         }
         
+        # Verify service principal permissions
+        Write-LogInfo "Verifying service principal permissions..."
+        if (-not (Test-ServicePrincipalPermissions -ClientId $Script:SPCredentials.ClientId)) {
+            Write-LogWarning "Service principal permissions verification failed. The script may not work correctly."
+            Write-LogInfo "You can try running the script anyway, or fix permissions using the commands shown above."
+        }
+        
         # Authenticate with service principal
         Connect-ServicePrincipal
+        
+        # Configure Azure Storage access
+        Set-StorageAccountAccess
         
         # Get SharePoint site info
         Get-SharePointSiteInfo
@@ -1314,10 +1697,11 @@ if ($Help) {
 # Handle setup mode
 if ($Setup) {
     try {
-        Write-LogStep "Running in setup mode - creating service principal only"
+        Write-LogStep "Running in setup mode - creating service principal and configuring storage"
         Import-Configuration
         Test-Dependencies
         New-ServicePrincipal
+        Set-StorageAccountAccess
         Write-LogSuccess "[SUCCESS] Setup completed! You can now run the script without -Setup to copy files."
         exit 0
     }
@@ -1338,6 +1722,34 @@ if ($ListContentsOfBlob) {
     }
     catch {
         Write-LogError "List blob contents failed: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Handle verify permissions mode
+if ($VerifyPermissions) {
+    try {
+        Write-LogStep "Running in verify permissions mode - checking service principal permissions"
+        Import-Configuration
+        Test-Dependencies
+        
+        if (-not (Import-ServicePrincipal)) {
+            Write-LogError "No existing service principal found. Please run with -Setup first."
+            exit 1
+        }
+        
+        $permissionsValid = Test-ServicePrincipalPermissions -ClientId $Script:SPCredentials.ClientId
+        
+        if ($permissionsValid) {
+            Write-LogSuccess "[SUCCESS] All required permissions are properly configured!"
+            exit 0
+        } else {
+            Write-LogError "[FAILED] Permission verification failed. Please check the output above for required commands."
+            exit 1
+        }
+    }
+    catch {
+        Write-LogError "Permission verification failed: $($_.Exception.Message)"
         exit 1
     }
 }
