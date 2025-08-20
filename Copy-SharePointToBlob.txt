@@ -1640,35 +1640,25 @@ function Copy-FilesToBlob {
                     # Upload to Azure Blob Storage with folder structure
                     Write-LogInfo "Uploading to blob storage: $blobPath"
                     
+                    # Use Out-Null to completely suppress Azure CLI output
                     $uploadSuccessful = $false
-                    $uploadError = ""
-                    
                     try {
                         # Choose authentication method based on configuration
                         if ($Script:Config['USE_AZURE_AD_AUTH'] -eq 'true') {
-                            Write-LogInfo "Using Azure AD authentication for blob upload"
-                            $uploadOutput = az storage blob upload --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login --container-name $Script:Config['CONTAINER_NAME'] --name $blobPath --file $tempFile --overwrite 2>&1
+                            & az storage blob upload --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --auth-mode login --container-name $Script:Config['CONTAINER_NAME'] --name $blobPath --file $tempFile --overwrite | Out-Null
                         } else {
-                            Write-LogInfo "Using storage account key authentication for blob upload"
-                            $uploadOutput = az storage blob upload --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] --container-name $Script:Config['CONTAINER_NAME'] --name $blobPath --file $tempFile --overwrite 2>&1
+                            & az storage blob upload --account-name $Script:Config['STORAGE_ACCOUNT_NAME'] --account-key $Script:Config['STORAGE_ACCOUNT_KEY'] --container-name $Script:Config['CONTAINER_NAME'] --name $blobPath --file $tempFile --overwrite | Out-Null
                         }
                         
-                        # Check exit code and capture any error output
+                        # If we get here without exception, upload was successful
                         if ($LASTEXITCODE -eq 0) {
                             $uploadSuccessful = $true
-                        } else {
-                            # Capture error details for troubleshooting
-                            if ($uploadOutput) {
-                                $uploadError = $uploadOutput -join "; "
-                            } else {
-                                $uploadError = "Azure CLI returned exit code $LASTEXITCODE with no error message"
-                            }
                         }
                     }
                     catch {
-                        $uploadError = "Exception during upload: $($_.Exception.Message)"
-                        if ($uploadOutput) {
-                            $uploadError += "; Azure CLI output: $($uploadOutput -join '; ')"
+                        # Ignore Azure CLI output issues - check exit code instead
+                        if ($LASTEXITCODE -eq 0) {
+                            $uploadSuccessful = $true
                         }
                     }
                     
@@ -1681,20 +1671,7 @@ function Copy-FilesToBlob {
                             Write-LogWarning "DELETE_AFTER_COPY is not implemented yet for safety"
                         }
                     } else {
-                        Write-LogError "Failed to upload file $($file.name): $uploadError"
-                        
-                        # Provide troubleshooting guidance on first error
-                        if ($errorCount -eq 0) {
-                            Write-LogInfo "Troubleshooting guidance for upload failure:"
-                            Write-LogInfo "1. Check storage account name: $($Script:Config['STORAGE_ACCOUNT_NAME'])"
-                            Write-LogInfo "2. Check container name: $($Script:Config['CONTAINER_NAME'])"
-                            Write-LogInfo "3. Verify Azure CLI login: az account show"
-                            if ($Script:Config['USE_AZURE_AD_AUTH'] -eq 'true') {
-                                Write-LogInfo "4. Test storage access: az storage container list --account-name $($Script:Config['STORAGE_ACCOUNT_NAME']) --auth-mode login"
-                            } else {
-                                Write-LogInfo "4. Test storage access: az storage container list --account-name $($Script:Config['STORAGE_ACCOUNT_NAME']) --account-key [KEY]"
-                            }
-                        }
+                        Write-LogError "Failed to upload file $($file.name): Azure CLI exit code $LASTEXITCODE"
                         $errorCount++
                     }
                 }
